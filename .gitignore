@@ -7,3 +7,5 @@ models/
 core
 core.*
 validation-local.json
+bin/
+*.mef

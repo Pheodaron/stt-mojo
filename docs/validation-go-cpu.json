@@ -1,0 +1,76 @@
+{
+  "max_version": "26.7.0",
+  "go_version": "1.25.3",
+  "device": "CPU",
+  "model_fixture": {
+    "hidden_size": 16,
+    "layers": 2,
+    "mel_bins": 4,
+    "speakers": 2,
+    "weights": "seeded random; not pretrained"
+  },
+  "pretrained_weights_tested": false,
+  "go_test": {
+    "race_detector": true,
+    "passed_test_cases": 31,
+    "skipped_test_cases": 0
+  },
+  "upstream_transformers_revision": "420dca92a4cf7d96dfbc1cc46f00375b0681ff8f",
+  "nemo_revision": "8eb458b8ee304143426be5070d3f55fb3b5fb736",
+  "end_to_end": {
+    "path": "Go gRPC -> Go frontend/cache -> cgo -> MAX C API -> CPU MEF graphs",
+    "audio_sample_counts": [
+      160,
+      161,
+      319,
+      320,
+      511,
+      512,
+      959,
+      960,
+      1120,
+      1280,
+      1600,
+      1607,
+      12017
+    ],
+    "transport_chunk_bytes": [
+      68,
+      4096
+    ],
+    "max_absolute_logit_error": 4.4703484e-08,
+    "independent_concurrent_recordings": 8,
+    "separate_go_server_and_client_tcp_smoke_test": true
+  },
+  "production_frontend": {
+    "mel_bins": 128,
+    "sample_rate": 16000,
+    "hop_length": 160,
+    "n_fft": 512,
+    "audio": "silence, sine and low-level noise; 32707 samples",
+    "max_absolute_mel_error": 2.8610229e-05
+  },
+  "nemo_cache": {
+    "original_methods_used_as_oracle": true,
+    "state_update_steps": 15,
+    "covers": [
+      "FIFO overflow",
+      "fresh predictions before first compression",
+      "compression",
+      "strong/weak/latest boosting",
+      "silence slots",
+      "speaker-major frame order"
+    ]
+  },
+  "two_hour_state_bound": {
+    "mel_frames": 720000,
+    "neural_engine": "test double",
+    "fft": "bypassed",
+    "claim": "Go orchestration state is bounded independently of duration; not a two-hour neural inference benchmark"
+  },
+  "limitations": [
+    "No pretrained NVIDIA checkpoint or diarization quality validation",
+    "No full-model service throughput benchmark",
+    "No GPU validation"
+  ]
+}

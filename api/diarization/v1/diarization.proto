@@ -1,0 +1,24 @@
+syntax = "proto3";
+package diarization.v1;
+option go_package = "github.com/Pheodaron/stt-mojo/api/diarization/v1;diarizationv1";
+
+service Diarization {
+  // One stream = one recording. CloseSend finishes the audio and flushes results.
+  rpc Diarize(stream AudioChunk) returns (stream Prediction);
+}
+
+message AudioChunk {
+  // Decoded mono PCM, 16000 Hz, IEEE float32 little endian. No WAV header.
+  // Every message must contain whole samples; transport chunk size is arbitrary.
+  bytes pcm_f32le = 1;
+}
+
+message Prediction {
+  // Absolute 10 ms frame index within this recording.
+  uint64 start_frame = 1;
+  uint32 num_frames = 2;
+  uint32 num_speakers = 3;
+  // Raw logits [num_frames, num_speakers], float32 little endian, row major.
+  // A positive logit means speaker probability > 0.5. Overlap is supported.
+  bytes logits_f32le = 4;
+}

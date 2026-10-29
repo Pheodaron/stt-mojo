@@ -1,4 +1,4 @@
-"""CPU float32 MAX graphs. No PyTorch calls, exports, or fallback backend."""
+"""CPU float32 MAX graphs, with optional MEF export for the native Go runtime."""
 
 import numpy as np
 from max.driver import CPU, Buffer
@@ -10,8 +10,9 @@ from .config import ModelConfig
 
 
 class MaxGraphs:
-    def __init__(self, config: ModelConfig, weights: dict[str, np.ndarray]):
+    def __init__(self, config: ModelConfig, weights: dict[str, np.ndarray], *, export_dir=None):
         self.config, self.weights = config, weights
+        self.export_dir = export_dir
         self.device = CPU()
         self.session = InferenceSession(devices=[self.device])
         self._registry = {}
@@ -35,6 +36,8 @@ class MaxGraphs:
 
     def _compile(self, graph):
         compiled = self.session.compile(graph)
+        if self.export_dir is not None:
+            compiled.export_mef(str(self.export_dir / (graph.name + ".mef")))
         return self.session.init(compiled, weights_registry=self._registry)
 
     def _compile_embedding(self):

@@ -40,7 +40,8 @@ left/current/right taps. The subpixel reshape preserves the original channel
 ordering; repeating encoder frames would be incorrect.
 
 All learned projections, attention, activation functions and upsampling execute
-inside MAX. NumPy handles pre/postprocessing and state policy. No PyTorch export,
+inside MAX. Go handles preprocessing and state policy in the service; NumPy is
+used only in the Python reference/export tools. No PyTorch export,
 ONNX, NeMo inference, or silent backend fallback is used. The CPU implementation
 uses standard MAX ops; no additional Mojo kernel is required at this stage.
 
@@ -60,13 +61,14 @@ uses standard MAX ops; no additional Mojo kernel is required at this stage.
    speaker's frames. Disabled slots use the learned `silence_embeds` and zero
    probabilities.
 
-NumPy uses deterministic stable selection on equal scores. Upstream `torch.topk`
+Go and the NumPy reference use deterministic stable selection on equal scores. Upstream `torch.topk`
 does not guarantee tie order. On exactly tied finite scores, the selected cache
 frames can differ; tests cover distinct finite scores and disabled/silence slots.
 Small float32 differences can also alter discrete choices at exact thresholds.
 
-Offline defaults: chunk 340, right context 40, FIFO 40, update period 300.
-Streaming: cache 264, FIFO 264, update period 222. The low-latency profile uses
+The Go service uses offline defaults: chunk 340, right context 40, FIFO 40,
+update period 300, cache 264. The checkpoint also describes streaming defaults
+with FIFO 264 and update period 222. Its low-latency profile uses
 chunk 9 and right context 4. All these counts refer to 80 ms encoder frames.
 
 ## CPU deployment choices
@@ -78,21 +80,34 @@ compile-time constants. The shard index may name only local filenames; standard
 Hugging Face cache symlinks to blob storage are supported. Inference output
 buffers are copied before returning to callers.
 
-The HTTP service exposes only `/infer/audio` and `/infer/features`. Requests and
-responses are raw little-endian float32 bytes. Audio is mono at 16 kHz; features
-are row-major log-mel matrices. Responses contain raw logits, not probabilities
-or segments. Input arrays are views of the request bytes, without JSON numeric
-lists, file decoding, or resampling. The model is compiled once at startup.
+The Go service exposes a single bidirectional gRPC method. Each RPC accepts PCM
+chunks for one recording and returns raw float32 logits with absolute frame
+offsets. There is no file decoding or resampling. Python builds CPU MEF artifacts
+once; the Go process loads them through MAX's public C API, with external
+safetensors weights. No Python interpreter or interprocess inference hop is used.
 
-Requests are independent: no session registry, TTL, result cache, or state shared
-between requests. AOSC/FIFO are private to a single model call and discarded when
-it completes. Updating this state after the last offline chunk is skipped.
-Speaker IDs have no correspondence across separate requests.
+The frontend preserves preemphasis and STFT overlap across arbitrary transport
+boundaries. It uses a Gonum real FFT and only nonzero regions of the exported
+Slaney filters. Windowing, power and mel accumulation retain float32 rounding;
+FFT work and log use float64, with results rounded back to float32. Numerical
+tests compare this frontend with upstream. Hann, mel and inverse RoPE frequencies
+are exported as exact float32 constants. RoPE sine/cosine tables are built once
+for the maximum encoder step, not for the recording length.
 
-One CPU inference runs at a time through an asynchronous capacity limiter, so
-requests wait without holding a blocked request thread. MAX uses its own CPU
-execution threads. This is not a batching scheduler. The service does not use
-MAX Serve, and concurrent execution on one model instance is not enabled.
+Only embeddings for the next chunk, right/left context and bounded AOSC/FIFO
+state are retained. Final STFT padding, feature-stacking padding and key masks
+match the checkpoint frontend; extra output frames are trimmed. Outputs are
+sent incrementally and gRPC flow control provides backpressure.
+
+RPCs are independent: no session registry, TTL or result cache. AOSC/FIFO are
+private to one RPC and discarded when it completes. Updating this state after
+the last offline chunk is skipped. Speaker IDs are local to the recording.
+
+One CPU graph call runs at a time, gated by a cancellable Go channel. MAX uses
+its own CPU execution threads. C borrows Go numeric buffers only during a single
+synchronous cgo call and copies completed outputs into Go-owned buffers before
+returning. All tensor handles are released; safetensors and the weights registry
+outlive both models. The service does not use MAX Serve or a batching scheduler.
 
 GPU device placement, BF16, fused attention kernels, device-resident cache updates,
 and benchmarking against NeMo are later optimization work. CPU numerical
