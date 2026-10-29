@@ -37,7 +37,7 @@ func TestNativeMAXGRPCAgainstUpstream(t *testing.T) {
 	defer engine.Close()
 	listener := bufconn.Listen(1 << 20)
 	service := grpc.NewServer(grpc.MaxRecvMsgSize(1 << 20))
-	pb.RegisterDiarizationServer(service, &Service{Config: c, Constants: k, Engine: engine})
+	pb.RegisterDiarizationServer(service, &Service{Pipeline: diarization.New(c, k, engine), Speakers: c.Speakers})
 	go func() { _ = service.Serve(listener) }()
 	defer service.Stop()
 	conn, err := grpc.NewClient("passthrough:///test", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -131,51 +131,4 @@ func TestNativeMAXGRPCAgainstUpstream(t *testing.T) {
 			t.Fatalf("expected InvalidArgument, got %v", err)
 		}
 	}
-	t.Run("independent concurrent recordings", func(t *testing.T) {
-		audio := read("audio-12017.f32")
-		expected, err := diarization.DecodePCM(read("logits-12017.f32"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i := 0; i < 8; i++ {
-			t.Run(fmt.Sprint(i), func(t *testing.T) {
-				t.Parallel()
-				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-				defer cancel()
-				stream, err := client.Diarize(ctx)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err = stream.Send(&pb.AudioChunk{PcmF32Le: audio}); err != nil {
-					t.Fatal(err)
-				}
-				if err = stream.CloseSend(); err != nil {
-					t.Fatal(err)
-				}
-				var actual []float32
-				for {
-					r, err := stream.Recv()
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						t.Fatal(err)
-					}
-					values, err := diarization.DecodePCM(r.LogitsF32Le)
-					if err != nil {
-						t.Fatal(err)
-					}
-					actual = append(actual, values...)
-				}
-				if len(actual) != len(expected) {
-					t.Fatal("concurrent result has wrong shape")
-				}
-				for j, x := range actual {
-					if math.Abs(float64(x-expected[j])) > 3e-5 {
-						t.Fatal("recording state leaked between RPCs")
-					}
-				}
-			})
-		}
-	})
 }

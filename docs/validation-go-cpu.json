@@ -2,6 +2,7 @@
   "max_version": "26.7.0",
   "go_version": "1.25.3",
   "device": "CPU",
+  "architecture": "sequential Pipeline.Run(ctx, io.Reader, emit); one recording at a time",
   "model_fixture": {
     "hidden_size": 16,
     "layers": 2,
@@ -11,14 +12,15 @@
   },
   "pretrained_weights_tested": false,
   "go_test": {
-    "race_detector": true,
-    "passed_test_cases": 31,
-    "skipped_test_cases": 0
+    "passed_test_cases": 23,
+    "skipped_test_cases": 0,
+    "go_vet": true,
+    "additional_targeted_test": "TestSequentialRecordingsStartFresh (passed separately)"
   },
   "upstream_transformers_revision": "420dca92a4cf7d96dfbc1cc46f00375b0681ff8f",
   "nemo_revision": "8eb458b8ee304143426be5070d3f55fb3b5fb736",
   "end_to_end": {
-    "path": "Go gRPC -> Go frontend/cache -> cgo -> MAX C API -> CPU MEF graphs",
+    "path": "gRPC io.Reader -> Go frontend/chunks/cache -> synchronous MAX C API -> CPU MEF graphs",
     "audio_sample_counts": [
       160,
       161,
@@ -39,7 +41,6 @@
       4096
     ],
     "max_absolute_logit_error": 4.4703484e-08,
-    "independent_concurrent_recordings": 8,
     "separate_go_server_and_client_tcp_smoke_test": true
   },
   "production_frontend": {
@@ -62,11 +63,16 @@
       "speaker-major frame order"
     ]
   },
-  "two_hour_state_bound": {
-    "mel_frames": 720000,
-    "neural_engine": "test double",
-    "fft": "bypassed",
-    "claim": "Go orchestration state is bounded independently of duration; not a two-hour neural inference benchmark"
+  "two_hour_recording": {
+    "sample_count": 115200000,
+    "input_allocation": "bounded silence reader; no full recording buffer",
+    "frontend": "real PCM decoding, preemphasis, Gonum FFT, log-mel",
+    "neural_model": "test double",
+    "output_frames": 720000,
+    "model_steps": 265,
+    "max_projection_frames": 380,
+    "max_encoder_frames": 684,
+    "claim": "Validates framing and bounded model input, not pretrained model throughput or process RSS"
   },
   "limitations": [
     "No pretrained NVIDIA checkpoint or diarization quality validation",

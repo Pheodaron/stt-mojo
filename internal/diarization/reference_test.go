@@ -1,13 +1,17 @@
 package diarization
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
+	"testing/iotest"
 )
 
 func fixtureDir(t *testing.T) string {
@@ -40,33 +44,7 @@ func TestFrontendAgainstUpstream(t *testing.T) {
 	for _, count := range []int{160, 161, 319, 320, 511, 512, 959, 960, 1120, 1280, 1600, 1607, 12017} {
 		audio := readFloats(t, dir, fmt.Sprintf("audio-%d.f32", count))
 		expected := readFloats(t, dir, fmt.Sprintf("mel-%d.f32", count))
-		f := newFrontend(c, k)
-		var actual []float32
-		emit := func(mel []float32, valid bool) error {
-			if valid != (len(actual)/c.MelBins < count/c.HopLength) {
-				t.Fatal("wrong feature mask")
-			}
-			actual = append(actual, mel...)
-			return nil
-		}
-		for start := 0; start < count; start += 17 {
-			if err = f.push(audio[start:min(start+17, count)], emit); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err = f.finish(emit); err != nil {
-			t.Fatal(err)
-		}
-		if len(actual) != len(expected) {
-			t.Fatal("wrong feature shape")
-		}
-		var maxError float64
-		for i, x := range actual {
-			maxError = max(maxError, math.Abs(float64(x-expected[i])))
-		}
-		if !(maxError <= 3e-5) {
-			t.Fatalf("%d samples: frontend max error %.8g", count, maxError)
-		}
+		maxError := compareFeatures(t, c, k, audio, expected)
 		t.Logf("samples=%d max mel error=%.8g", count, maxError)
 	}
 }
@@ -77,13 +55,13 @@ func TestCacheSelectionAgainstReference(t *testing.T) {
 	c.HiddenSize = 1
 	c.Speakers = 8
 	c.CacheLength = 264
-	s := speakerCache{c: c, probs: readFloats(t, dir, "cache-probs.f32"), embeds: make([]float32, 564)}
-	for i := range s.embeds {
-		s.embeds[i] = float32(i)
+	s := speakerCache{config: c, probabilities: readFloats(t, dir, "cache-probs.f32"), embeddings: make([]float32, 564)}
+	for i := range s.embeddings {
+		s.embeddings[i] = float32(i)
 	}
 	s.compress([]float32{-1})
 	expected := readFloats(t, dir, "cache-selected.f32")
-	if !slices.Equal(s.embeds, expected) {
+	if !slices.Equal(s.embeddings, expected) {
 		t.Fatal("cache frame selection differs from the NeMo policy")
 	}
 }
@@ -96,27 +74,7 @@ func TestProductionFrontendAgainstUpstream(t *testing.T) {
 	k.Window, k.MelFilters = constants[:c.NFFT], constants[c.NFFT:]
 	audio := readFloats(t, dir, "frontend128-audio.f32")
 	expected := readFloats(t, dir, "frontend128-mel.f32")
-	f := newFrontend(c, k)
-	var actual []float32
-	emit := func(mel []float32, _ bool) error { actual = append(actual, mel...); return nil }
-	for start := 0; start < len(audio); start += 137 {
-		if err := f.push(audio[start:min(start+137, len(audio))], emit); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := f.finish(emit); err != nil {
-		t.Fatal(err)
-	}
-	if len(actual) != len(expected) {
-		t.Fatal("wrong production feature shape")
-	}
-	var maxError float64
-	for i, x := range actual {
-		maxError = max(maxError, math.Abs(float64(x-expected[i])))
-	}
-	if !(maxError <= 3e-5) {
-		t.Fatalf("production frontend max error %.8g", maxError)
-	}
+	maxError := compareFeatures(t, c, k, audio, expected)
 	t.Logf("128-channel frontend max mel error=%.8g", maxError)
 }
 
@@ -137,14 +95,12 @@ func TestStateUpdatesAgainstNeMo(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, _ := testConfig()
-	s := speakerCache{c: c}
+	s := speakerCache{config: c}
 	for step, r := range steps {
-		valid := make([]bool, len(r.Inputs)/c.HiddenSize)
-		for i := range valid {
-			valid[i] = true
-		}
-		s.update(r.Inputs, r.Logits, valid, r.Lookback, r.Frames, []float32{-1, -1, -1, -1})
-		for name, pair := range map[string][2][]float32{"cache": {s.embeds, r.Cache}, "FIFO": {s.fifo, r.FIFO}, "probs": {s.probs, r.Probs}} {
+		prefix := (len(s.embeddings) + len(s.fifo)) / c.HiddenSize
+		window := chunk{embeddings: r.Inputs[prefix*c.HiddenSize:], leftFrames: r.Lookback, newFrames: r.Frames}
+		s.update(window, r.Logits, []float32{-1, -1, -1, -1})
+		for name, pair := range map[string][2][]float32{"cache": {s.embeddings, r.Cache}, "FIFO": {s.fifo, r.FIFO}, "probs": {s.probabilities, r.Probs}} {
 			if len(pair[0]) != len(pair[1]) {
 				t.Fatalf("step %d %s shape differs from NeMo", step, name)
 			}
@@ -158,4 +114,34 @@ func TestStateUpdatesAgainstNeMo(t *testing.T) {
 	if !s.compressed {
 		t.Fatal("NeMo fixture did not exercise compression")
 	}
+}
+
+func compareFeatures(t *testing.T, config Config, constants Constants, audio, expected []float32) float64 {
+	t.Helper()
+	reader := newFeatureReader(iotest.OneByteReader(bytes.NewReader(EncodeFloat32(audio))), config, constants)
+	buffer := make([]float32, 17*config.MelBins)
+	var actual []float32
+	validFrames := 0
+	for {
+		frames, valid, err := reader.readFrames(context.Background(), buffer)
+		actual = append(actual, buffer[:frames*config.MelBins]...)
+		validFrames += valid
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(actual) != len(expected) || validFrames != len(audio)/config.HopLength {
+		t.Fatal("wrong feature shape or valid length")
+	}
+	var maxError float64
+	for i, value := range actual {
+		maxError = max(maxError, math.Abs(float64(value-expected[i])))
+	}
+	if !(maxError <= 3e-5) {
+		t.Fatalf("frontend max error %.8g", maxError)
+	}
+	return maxError
 }

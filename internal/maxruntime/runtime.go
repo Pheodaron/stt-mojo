@@ -8,7 +8,6 @@ package maxruntime
 import "C"
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"os"
@@ -20,15 +19,14 @@ import (
 )
 
 type Runtime struct {
-	ptr      *C.NemotronMAX
-	c        diarization.Config
-	gate     chan struct{}
-	cos, sin []float32
+	handle         *C.NemotronMAX
+	config         diarization.Config
+	cosines, sines []float32
 }
 
 // Open creates the process's single MAX context and loads the compiled graphs.
 // root is the Modular SDK package directory containing lib/.
-func Open(bundle, root string, c diarization.Config, k diarization.Constants) (*Runtime, error) {
+func Open(bundle, root string, config diarization.Config, constants diarization.Constants) (*Runtime, error) {
 	if root == "" {
 		return nil, fmt.Errorf("set --max-root or MAX_ROOT to the Modular SDK directory")
 	}
@@ -55,20 +53,20 @@ func Open(bundle, root string, c diarization.Config, k diarization.Constants) (*
 	if ptr == nil {
 		return nil, nativeError(message)
 	}
-	r := &Runtime{ptr: ptr, c: c, gate: make(chan struct{}, 1)}
+	r := &Runtime{handle: ptr, config: config}
 	// Positions restart at zero for each [speaker cache, FIFO, context, chunk].
 	// These immutable tables replace trigonometry and allocations per step.
-	maxFrames := c.CacheLength + c.FIFOLength + c.LeftContext + c.ChunkLength + c.RightContext
-	r.cos = make([]float32, maxFrames*c.RotaryDim)
-	r.sin = make([]float32, len(r.cos))
+	maxFrames := config.CacheLength + config.FIFOLength + config.LeftContext + config.ChunkLength + config.RightContext
+	r.cosines = make([]float32, maxFrames*config.RotaryDim)
+	r.sines = make([]float32, len(r.cosines))
 	for t := 0; t < maxFrames; t++ {
-		for j, inv := range k.InvFreq {
+		for j, inv := range constants.InvFreq {
 			angle := float32(t) * inv
 			s, co := math.Sincos(float64(angle))
-			first := t*c.RotaryDim + j
-			second := first + c.RotaryDim/2
-			r.cos[first], r.cos[second] = float32(co), float32(co)
-			r.sin[first], r.sin[second] = float32(s), float32(s)
+			first := t*config.RotaryDim + j
+			second := first + config.RotaryDim/2
+			r.cosines[first], r.cosines[second] = float32(co), float32(co)
+			r.sines[first], r.sines[second] = float32(s), float32(s)
 		}
 	}
 	return r, nil
@@ -82,83 +80,65 @@ func nativeError(message *C.char) error {
 	return fmt.Errorf("MAX: %s", C.GoString(message))
 }
 
-// Close waits for active execution. Subsequent callers get an error.
+// Close releases both graphs and their weights. The caller finishes Run first.
 func (r *Runtime) Close() {
-	r.gate <- struct{}{}
-	defer func() { <-r.gate }()
-	if r.ptr != nil {
-		C.nemotron_close(r.ptr)
-		r.ptr = nil
+	if r.handle != nil {
+		C.nemotron_close(r.handle)
+		r.handle = nil
 	}
 }
 
-func (r *Runtime) acquire(ctx context.Context) error {
-	select {
-	case r.gate <- struct{}{}:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	if err := ctx.Err(); err != nil {
-		<-r.gate
-		return err
-	}
-	if r.ptr == nil {
-		<-r.gate
-		return fmt.Errorf("MAX runtime is closed")
-	}
-	return nil
-}
+func floatPointer(values []float32) *C.float { return (*C.float)(unsafe.Pointer(&values[0])) }
 
-func pointer(v []float32) *C.float { return (*C.float)(unsafe.Pointer(&v[0])) }
-
-func (r *Runtime) Embed(ctx context.Context, features []float32) ([]float32, error) {
-	width := r.c.Factor * r.c.MelBins
+func (r *Runtime) Embed(features []float32) ([]float32, error) {
+	width := r.config.Factor * r.config.MelBins
 	if len(features) == 0 || len(features)%width != 0 {
 		return nil, fmt.Errorf("invalid feature shape")
 	}
-	if err := r.acquire(ctx); err != nil {
-		return nil, err
+	if r.handle == nil {
+		return nil, fmt.Errorf("MAX runtime is closed")
 	}
-	defer func() { <-r.gate }()
 	frames := len(features) / width
-	output := make([]float32, frames*r.c.HiddenSize)
+	output := make([]float32, frames*r.config.HiddenSize)
 	var message *C.char
-	ok := C.nemotron_embed(r.ptr, pointer(features), C.size_t(frames), C.size_t(width), C.size_t(r.c.HiddenSize), pointer(output), &message)
+	ok := C.nemotron_embed(
+		r.handle, floatPointer(features),
+		C.size_t(frames), C.size_t(width), C.size_t(r.config.HiddenSize),
+		floatPointer(output), &message,
+	)
 	runtime.KeepAlive(features)
 	if ok == 0 {
 		return nil, nativeError(message)
 	}
-	return output, ctx.Err()
+	return output, nil
 }
 
-func (r *Runtime) Infer(ctx context.Context, embeddings []float32, valid []bool) ([]float32, error) {
-	frames := len(valid)
-	if frames == 0 || len(embeddings) != frames*r.c.HiddenSize || frames*r.c.RotaryDim > len(r.cos) {
+func (r *Runtime) Predict(embeddings []float32, validFrames int) ([]float32, error) {
+	frames := len(embeddings) / r.config.HiddenSize
+	if frames == 0 || len(embeddings) != frames*r.config.HiddenSize || frames*r.config.RotaryDim > len(r.cosines) {
 		return nil, fmt.Errorf("invalid encoder shape")
 	}
-	if err := r.acquire(ctx); err != nil {
-		return nil, err
+	if r.handle == nil {
+		return nil, fmt.Errorf("MAX runtime is closed")
 	}
-	defer func() { <-r.gate }()
 	mask := make([]float32, frames)
-	hasValid := false
-	for i, v := range valid {
-		if v {
-			hasValid = true
-		} else {
-			mask[i] = -math.MaxFloat32
-		}
+	if validFrames < 1 || validFrames > frames {
+		return nil, fmt.Errorf("invalid encoder valid length")
 	}
-	if !hasValid {
-		return nil, fmt.Errorf("encoder needs at least one valid key")
+	for i := validFrames; i < frames; i++ {
+		mask[i] = -math.MaxFloat32
 	}
-	output := make([]float32, frames*r.c.Factor*r.c.Speakers)
+	output := make([]float32, frames*r.config.Factor*r.config.Speakers)
 	var message *C.char
-	ok := C.nemotron_infer(r.ptr, pointer(embeddings), pointer(r.cos), pointer(r.sin), pointer(mask), C.size_t(frames), C.size_t(r.c.HiddenSize), C.size_t(r.c.RotaryDim), C.size_t(len(output)), pointer(output), &message)
+	ok := C.nemotron_infer(
+		r.handle, floatPointer(embeddings), floatPointer(r.cosines), floatPointer(r.sines), floatPointer(mask),
+		C.size_t(frames), C.size_t(r.config.HiddenSize), C.size_t(r.config.RotaryDim),
+		C.size_t(len(output)), floatPointer(output), &message,
+	)
 	runtime.KeepAlive(embeddings)
 	runtime.KeepAlive(mask)
 	if ok == 0 {
 		return nil, nativeError(message)
 	}
-	return output, ctx.Err()
+	return output, nil
 }

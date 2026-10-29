@@ -1,152 +1,209 @@
 package diarization
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"math"
 	"slices"
 	"testing"
+	"testing/iotest"
 )
 
 func testConfig() (Config, Constants) {
-	pre := float32(.97)
-	c := Config{Version: 1, MAXVersion: "26.7.0", Target: "cpu", SampleRate: 16000, HopLength: 160, NFFT: 512, Preemphasis: &pre,
-		MelBins: 4, HiddenSize: 4, Factor: 2, RotaryDim: 2, Speakers: 2, ChunkLength: 3, RightContext: 1, LeftContext: 1,
-		FIFOLength: 3, UpdatePeriod: 2, CacheLength: 8, SilenceFrames: 1, PredictionThreshold: .25, LatestBoost: .05, StrongBoost: .75, WeakBoost: 1.5, MinPositiveRate: .5}
-	k := Constants{Window: make([]float32, c.NFFT), MelFilters: make([]float32, c.MelBins*(c.NFFT/2+1)), Silence: make([]float32, c.HiddenSize)}
-	for i := range k.Window {
-		k.Window[i] = 1
+	preemphasis := float32(.97)
+	config := Config{
+		Version: 1, MAXVersion: "26.7.0", Target: "cpu",
+		SampleRate: 16000, HopLength: 160, NFFT: 512, Preemphasis: &preemphasis,
+		MelBins: 4, HiddenSize: 4, Factor: 2, RotaryDim: 2, Speakers: 2,
+		ChunkLength: 3, RightContext: 1, LeftContext: 1,
+		FIFOLength: 3, UpdatePeriod: 2, CacheLength: 8, SilenceFrames: 1,
+		PredictionThreshold: .25, LatestBoost: .05, StrongBoost: .75, WeakBoost: 1.5, MinPositiveRate: .5,
 	}
-	for i := range k.MelFilters {
-		k.MelFilters[i] = float32(i%7+1) * .001
+	constants := Constants{
+		Window:     make([]float32, config.NFFT),
+		MelFilters: make([]float32, config.MelBins*(config.NFFT/2+1)),
+		Silence:    make([]float32, config.HiddenSize),
 	}
-	return c, k
+	for i := range constants.Window {
+		constants.Window[i] = 1
+	}
+	for i := range constants.MelFilters {
+		constants.MelFilters[i] = float32(i%7+1) * .001
+	}
+	return config, constants
 }
 
-// A cheap state-sensitive engine for transport, memory and cancellation tests.
-// Neural correctness is checked separately against the exported upstream model.
-type testEngine struct {
-	c                Config
-	calls, maxFrames int
+// Numerical correctness uses the exported MAX fixture. This inexpensive model
+// makes framing, state lifetime and duration tests independent of the SDK.
+type testModel struct {
+	config                          Config
+	calls, maxFrames, maxProjection int
 }
 
-func (e *testEngine) Embed(ctx context.Context, features []float32) ([]float32, error) {
-	out := make([]float32, len(features)/(e.c.MelBins*e.c.Factor)*e.c.HiddenSize)
-	for i := range out {
-		out[i] = features[(i/e.c.HiddenSize)*e.c.MelBins*e.c.Factor+i%e.c.MelBins]
+func (m *testModel) Embed(features []float32) ([]float32, error) {
+	m.maxProjection = max(m.maxProjection, len(features)/(m.config.MelBins*m.config.Factor))
+	output := make([]float32, len(features)/(m.config.MelBins*m.config.Factor)*m.config.HiddenSize)
+	for i := range output {
+		frame, channel := i/m.config.HiddenSize, i%m.config.MelBins
+		output[i] = features[frame*m.config.MelBins*m.config.Factor+channel]
 	}
-	return out, ctx.Err()
+	return output, nil
 }
-func (e *testEngine) Infer(ctx context.Context, embeds []float32, valid []bool) ([]float32, error) {
-	e.calls++
-	e.maxFrames = max(e.maxFrames, len(valid))
+
+func (m *testModel) Predict(embeddings []float32, validFrames int) ([]float32, error) {
+	frames := len(embeddings) / m.config.HiddenSize
+	m.calls++
+	m.maxFrames = max(m.maxFrames, frames)
 	var sum float32
-	for i, v := range valid {
-		if v {
-			sum += embeds[i*e.c.HiddenSize]
-		}
+	for frame := 0; frame < validFrames; frame++ {
+		sum += embeddings[frame*m.config.HiddenSize]
 	}
-	mean := sum / float32(len(valid))
-	out := make([]float32, len(valid)*e.c.Factor*e.c.Speakers)
-	for i := range out {
-		out[i] = mean*.01 + embeds[(i/(e.c.Speakers*e.c.Factor))*e.c.HiddenSize]*.1
+	mean := sum / float32(frames)
+	output := make([]float32, frames*m.config.Factor*m.config.Speakers)
+	for i := range output {
+		frame := i / (m.config.Speakers * m.config.Factor)
+		output[i] = mean*.01 + embeddings[frame*m.config.HiddenSize]*.1
 	}
-	return out, ctx.Err()
+	return output, nil
 }
 
 func TestTransportBoundariesAndLastFrames(t *testing.T) {
 	for _, right := range []int{0, 1, 4} {
-		for _, count := range []int{160, 161, 319, 320, 511, 959, 960, 1120, 1280, 1607, 12017} {
-			c, k := testConfig()
-			c.RightContext = right
-			audio := make([]float32, count)
+		for _, samples := range []int{160, 161, 319, 320, 511, 959, 960, 1120, 1280, 1607, 12017} {
+			config, constants := testConfig()
+			config.RightContext = right
+			audio := make([]float32, samples)
 			for i := range audio {
 				audio[i] = float32(math.Sin(float64(i)*.17)) * .1
 			}
+			data := EncodeFloat32(audio)
+			readers := []io.Reader{
+				bytes.NewReader(data),
+				iotest.OneByteReader(bytes.NewReader(data)),
+				iotest.HalfReader(bytes.NewReader(data)),
+			}
 			var expected []float32
-			for _, chunk := range []int{count, 1, 17, 160, 513} {
-				p := NewPipeline(c, k, &testEngine{c: c})
+			for _, reader := range readers {
+				pipeline := New(config, constants, &testModel{config: config})
 				var actual []float32
-				emit := func(r Result) error {
-					if int(r.StartFrame) != len(actual)/c.Speakers {
+				err := pipeline.Run(context.Background(), reader, func(result Result) error {
+					if int(result.StartFrame) != len(actual)/config.Speakers {
 						t.Fatal("discontinuous frame offsets")
 					}
-					actual = append(actual, r.Logits...)
+					actual = append(actual, result.Logits...)
 					return nil
-				}
-				for start := 0; start < count; start += chunk {
-					if err := p.Push(context.Background(), audio[start:min(start+chunk, count)], emit); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := p.Finish(context.Background(), emit); err != nil {
+				})
+				if err != nil {
 					t.Fatal(err)
 				}
-				if len(actual) != count/c.HopLength*c.Speakers {
-					t.Fatalf("right=%d samples=%d chunk=%d: wrong output length %d", right, count, chunk, len(actual))
+				if len(actual) != samples/config.HopLength*config.Speakers {
+					t.Fatalf("right=%d samples=%d: wrong output length %d", right, samples, len(actual))
 				}
 				if expected == nil {
 					expected = actual
 				} else if !slices.Equal(expected, actual) {
-					t.Fatalf("right=%d samples=%d chunk=%d: transport boundary changed results", right, count, chunk)
+					t.Fatal("transport boundaries changed results")
 				}
 			}
 		}
 	}
 }
 
-func TestTwoHourStateIsBounded(t *testing.T) {
-	c, k := testConfig()
-	c.ChunkLength = 340
-	c.RightContext = 40
-	c.LeftContext = 0
-	c.Factor = 8
-	c.Speakers = 8
-	c.CacheLength = 264
-	c.FIFOLength = 40
-	c.UpdatePeriod = 300
-	e := &testEngine{c: c}
-	p := NewPipeline(c, k, e)
-	mel := []float32{.1, .2, .3, .4}
-	emit := func(Result) error { return nil }
-	// Exercise two hours of 10 ms frames without spending time on repeated FFTs
-	// or neural inference. This verifies duration-independent orchestration state.
-	for i := 0; i < 720000; i++ {
-		if err := p.feature(context.Background(), mel, true, emit); err != nil {
-			t.Fatal(err)
+type silenceReader struct{}
+
+func (silenceReader) Read(dst []byte) (int, error) { clear(dst); return len(dst), nil }
+
+func TestTwoHourRecording(t *testing.T) {
+	config, constants := testConfig()
+	config.ChunkLength, config.RightContext, config.LeftContext = 340, 40, 0
+	config.Factor, config.Speakers = 8, 8
+	config.CacheLength, config.FIFOLength, config.UpdatePeriod = 264, 40, 300
+	model := &testModel{config: config}
+	pipeline := New(config, constants, model)
+	// Real PCM decoding and FFT, inexpensive model, no two-hour input allocation.
+	audio := io.LimitReader(silenceReader{}, 2*3600*int64(config.SampleRate)*4)
+	var frames uint64
+	err := pipeline.Run(context.Background(), audio, func(result Result) error {
+		if result.StartFrame != frames {
+			t.Fatal("discontinuous output")
 		}
-		if len(p.features) > (c.ChunkLength+c.RightContext)*c.Factor*c.MelBins || len(p.embeddings) > (c.LeftContext+c.ChunkLength+c.RightContext)*c.HiddenSize || len(p.cache.embeds) > c.CacheLength*c.HiddenSize || len(p.cache.fifo) > c.FIFOLength*c.HiddenSize {
-			t.Fatal("state exceeded its configured bound")
-		}
+		frames += uint64(len(result.Logits) / config.Speakers)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !p.cache.compressed {
-		t.Fatal("speaker cache was never compressed")
+	if frames != 720000 || model.calls != 265 {
+		t.Fatalf("got %d frames in %d model calls", frames, model.calls)
 	}
-	if e.calls < 260 || e.calls > 265 {
-		t.Fatalf("unexpected step count: %d", e.calls)
+	if model.maxProjection > 380 || model.maxFrames > 684 {
+		t.Fatal("model input exceeded the configured window")
 	}
 }
 
-func TestCancellationAndBackpressureErrors(t *testing.T) {
-	c, k := testConfig()
-	p := NewPipeline(c, k, &testEngine{c: c})
+func TestCancellationAndOutputErrors(t *testing.T) {
+	config, constants := testConfig()
+	pipeline := New(config, constants, &testModel{config: config})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := p.Push(ctx, make([]float32, 512), func(Result) error { return nil }); !errors.Is(err, context.Canceled) {
+	err := pipeline.Run(ctx, bytes.NewReader(make([]byte, 40000)), func(Result) error { return nil })
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v", err)
 	}
-	p = NewPipeline(c, k, &testEngine{c: c})
 	sentinel := errors.New("consumer stopped")
-	err := p.Push(context.Background(), make([]float32, 5000), func(Result) error { return sentinel })
+	err = pipeline.Run(context.Background(), bytes.NewReader(make([]byte, 40000)), func(Result) error { return sentinel })
 	if !errors.Is(err, sentinel) {
-		t.Fatalf("send error lost: %v", err)
+		t.Fatalf("output error lost: %v", err)
+	}
+	err = pipeline.Run(context.Background(), iotest.ErrReader(sentinel), func(Result) error { return nil })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("read error lost: %v", err)
 	}
 }
 
-func TestPCMValidation(t *testing.T) {
-	for _, data := range [][]byte{{1}, EncodeFloat32([]float32{float32(math.NaN())}), EncodeFloat32([]float32{float32(math.Inf(1))})} {
-		if _, err := DecodePCM(data); err == nil {
-			t.Fatal("accepted invalid PCM")
+func TestSequentialRecordingsStartFresh(t *testing.T) {
+	config, constants := testConfig()
+	pipeline := New(config, constants, &testModel{config: config})
+	audio := make([]float32, 12017)
+	for i := range audio {
+		audio[i] = float32(math.Sin(float64(i)*.17)) * .1
+	}
+	data := EncodeFloat32(audio)
+	run := func() []float32 {
+		t.Helper()
+		var logits []float32
+		err := pipeline.Run(context.Background(), bytes.NewReader(data), func(result Result) error {
+			if result.StartFrame != uint64(len(logits)/config.Speakers) {
+				t.Fatal("recording inherited an output offset")
+			}
+			logits = append(logits, result.Logits...)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return logits
+	}
+	expected := run()
+	sentinel := errors.New("stop this recording")
+	err := pipeline.Run(context.Background(), bytes.NewReader(make([]byte, 40000)), func(Result) error { return sentinel })
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("got %v", err)
+	}
+	if actual := run(); !slices.Equal(actual, expected) {
+		t.Fatal("a previous recording changed the result")
+	}
+}
+
+func TestInvalidPCM(t *testing.T) {
+	config, constants := testConfig()
+	pipeline := New(config, constants, &testModel{config: config})
+	for _, data := range [][]byte{nil, {1}, make([]byte, 639), EncodeFloat32([]float32{float32(math.NaN())}), EncodeFloat32([]float32{float32(math.Inf(1))})} {
+		err := pipeline.Run(context.Background(), bytes.NewReader(data), func(Result) error { return nil })
+		if !errors.Is(err, ErrInvalidAudio) {
+			t.Fatalf("invalid audio returned %v", err)
 		}
 	}
 }

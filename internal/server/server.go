@@ -3,8 +3,7 @@ package server
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
+	"fmt"
 
 	pb "github.com/Pheodaron/stt-mojo/api/diarization/v1"
 	"github.com/Pheodaron/stt-mojo/internal/diarization"
@@ -13,57 +12,59 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Service has one shared model, with no registry of recordings or cached results.
+// Service assumes one active recording. The client starts the next RPC after EOF.
 type Service struct {
 	pb.UnimplementedDiarizationServer
-	Config    diarization.Config
-	Constants diarization.Constants
-	Engine    diarization.Engine
+	Pipeline *diarization.Pipeline
+	Speakers int
 }
 
 func (s *Service) Diarize(stream grpc.BidiStreamingServer[pb.AudioChunk, pb.Prediction]) error {
-	pipeline := diarization.NewPipeline(s.Config, s.Constants, s.Engine)
-	emit := func(result diarization.Result) error {
+	err := s.Pipeline.Run(stream.Context(), &audioReader{stream: stream}, func(result diarization.Result) error {
 		return stream.Send(&pb.Prediction{
 			StartFrame:  result.StartFrame,
-			NumFrames:   uint32(len(result.Logits) / s.Config.Speakers),
-			NumSpeakers: uint32(s.Config.Speakers),
+			NumFrames:   uint32(len(result.Logits) / s.Speakers),
+			NumSpeakers: uint32(s.Speakers),
 			LogitsF32Le: diarization.EncodeFloat32(result.Logits),
 		})
-	}
-	var samples int64
-	for {
-		chunk, err := stream.Recv()
-		if err == io.EOF {
-			if samples < int64(s.Config.HopLength) {
-				return status.Error(codes.InvalidArgument, "audio must contain at least 160 samples")
-			}
-			return inferenceError(pipeline.Finish(stream.Context(), emit))
-		}
-		if err != nil {
-			return err
-		}
-		audio, err := diarization.DecodePCM(chunk.PcmF32Le)
-		if err != nil {
-			return status.Error(codes.InvalidArgument, err.Error())
-		}
-		samples += int64(len(audio))
-		if err = pipeline.Push(stream.Context(), audio, emit); err != nil {
-			return inferenceError(err)
-		}
-	}
-}
-
-func inferenceError(err error) error {
-	if err == nil {
-		return nil
+	})
+	if errors.Is(err, diarization.ErrInvalidAudio) {
+		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return status.FromContextError(err).Err()
 	}
-	if _, ok := status.FromError(err); ok {
-		return err
+	if err != nil {
+		if _, ok := status.FromError(err); ok {
+			return err
+		}
+		return status.Error(codes.Internal, err.Error())
 	}
-	slog.Error("diarization failed", "error", err)
-	return status.Error(codes.Internal, "model inference failed")
+	return nil
+}
+
+// audioReader adapts gRPC messages to an ordinary PCM byte stream. It contains
+// no inference logic; file and network input use the same pipeline.
+type audioReader struct {
+	stream  grpc.BidiStreamingServer[pb.AudioChunk, pb.Prediction]
+	pending []byte
+}
+
+func (r *audioReader) Read(dst []byte) (int, error) {
+	if len(dst) == 0 {
+		return 0, nil
+	}
+	for len(r.pending) == 0 {
+		message, err := r.stream.Recv()
+		if err != nil {
+			return 0, err
+		}
+		if len(message.PcmF32Le)%4 != 0 {
+			return 0, fmt.Errorf("%w: message contains an incomplete sample", diarization.ErrInvalidAudio)
+		}
+		r.pending = message.PcmF32Le
+	}
+	n := copy(dst, r.pending)
+	r.pending = r.pending[n:]
+	return n, nil
 }

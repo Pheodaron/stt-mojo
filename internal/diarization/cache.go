@@ -1,156 +1,193 @@
-// SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-// Port of NeMo Sortformer streaming_update and _compress_spkcache. See NOTICE.
 package diarization
 
 import (
+	"cmp"
 	"math"
 	"slices"
-	"sort"
 )
 
-// speakerCache is model state for one recording, bounded by the exported policy.
+// speakerCache keeps recent context in FIFO and representative older frames
+// grouped by speaker. Its policy follows NeMo streaming_update/_compress_spkcache.
 type speakerCache struct {
-	c                   Config
-	embeds, probs, fifo []float32
-	compressed          bool
+	config        Config
+	embeddings    []float32
+	probabilities []float32
+	fifo          []float32
+	compressed    bool
 }
 
-func (s *speakerCache) update(inputs, logits []float32, valid []bool, lookback, frames int, silence []float32) {
-	c := s.c
-	nCache, nFIFO := len(s.embeds)/c.HiddenSize, len(s.fifo)/c.HiddenSize
-	start := nCache + nFIFO + lookback
-	s.fifo = append(s.fifo, inputs[start*c.HiddenSize:(start+frames)*c.HiddenSize]...)
-	if nFIFO+frames <= c.FIFOLength {
+func (s *speakerCache) input(embeddings []float32) ([]float32, int) {
+	input := make([]float32, 0, len(s.embeddings)+len(s.fifo)+len(embeddings))
+	input = append(input, s.embeddings...)
+	input = append(input, s.fifo...)
+	prefix := len(input) / s.config.HiddenSize
+	return append(input, embeddings...), prefix
+}
+
+func (s *speakerCache) update(chunk chunk, logits, silence []float32) {
+	config := s.config
+	cacheFrames := len(s.embeddings) / config.HiddenSize
+	fifoFrames := len(s.fifo) / config.HiddenSize
+	start := chunk.leftFrames * config.HiddenSize
+	end := start + chunk.newFrames*config.HiddenSize
+	s.fifo = append(s.fifo, chunk.embeddings[start:end]...)
+	if fifoFrames+chunk.newFrames <= config.FIFOLength {
 		return
 	}
-	pop := min(max(c.UpdatePeriod, nFIFO+frames-c.FIFOLength), nFIFO+frames)
-	// NeMo refreshes FIFO predictions every step and cache predictions until its
-	// first compression. Pool frame probabilities, not logits, over subsampling.
-	pooled := make([]float32, len(valid)*c.Speakers)
-	for t, ok := range valid {
-		if !ok {
-			continue
-		}
-		for f := 0; f < c.Factor; f++ {
-			for sp := 0; sp < c.Speakers; sp++ {
-				x := logits[(t*c.Factor+f)*c.Speakers+sp]
-				pooled[t*c.Speakers+sp] += sigmoid(x)
-			}
-		}
-		for sp := 0; sp < c.Speakers; sp++ {
-			pooled[t*c.Speakers+sp] /= float32(c.Factor)
-		}
-	}
+
+	pop := min(max(config.UpdatePeriod, fifoFrames+chunk.newFrames-config.FIFOLength), fifoFrames+chunk.newFrames)
+	probs := poolProbabilities(logits, config.Factor, config.Speakers)
 	if !s.compressed {
-		s.probs = append(s.probs[:0], pooled[:nCache*c.Speakers]...)
+		// Until compression, cache frames are chronological: refresh their scores.
+		s.probabilities = append(s.probabilities[:0], probs[:cacheFrames*config.Speakers]...)
 	}
-	oldFIFOProbs := pooled[nCache*c.Speakers : (nCache+nFIFO)*c.Speakers]
-	newProbs := pooled[start*c.Speakers : (start+frames)*c.Speakers]
-	fifoProbs := append(slices.Clone(oldFIFOProbs), newProbs...)
-	s.embeds = append(s.embeds, s.fifo[:pop*c.HiddenSize]...)
-	s.probs = append(s.probs, fifoProbs[:pop*c.Speakers]...)
-	s.fifo = slices.Clone(s.fifo[pop*c.HiddenSize:])
-	if len(s.embeds)/c.HiddenSize > c.CacheLength {
+	oldFIFO := probs[cacheFrames*config.Speakers : (cacheFrames+fifoFrames)*config.Speakers]
+	newStart := (cacheFrames + fifoFrames + chunk.leftFrames) * config.Speakers
+	newChunk := probs[newStart : newStart+chunk.newFrames*config.Speakers]
+	fifoProbs := append(slices.Clone(oldFIFO), newChunk...)
+
+	s.embeddings = append(s.embeddings, s.fifo[:pop*config.HiddenSize]...)
+	s.probabilities = append(s.probabilities, fifoProbs[:pop*config.Speakers]...)
+	s.fifo = slices.Clone(s.fifo[pop*config.HiddenSize:])
+	if len(s.embeddings)/config.HiddenSize > config.CacheLength {
 		s.compress(silence)
 		s.compressed = true
 	}
 }
 
-func sigmoid(x float32) float32 {
-	if x >= 0 {
-		return float32(1 / (1 + math.Exp(-float64(x))))
-	}
-	e := math.Exp(float64(x))
-	return float32(e / (1 + e))
-}
-
-// topIndices resolves ties by original index. torch.topk leaves tie order
-// unspecified; choosing it explicitly makes CPU runs reproducible.
-func topIndices(values []float32, n int) []int {
-	indices := make([]int, len(values))
-	for i := range indices {
-		indices[i] = i
-	}
-	sort.SliceStable(indices, func(i, j int) bool { return values[indices[i]] > values[indices[j]] })
-	return indices[:min(n, len(indices))]
-}
-
-func boostTop(scores []float32, count int, amount float32) {
-	for _, i := range topIndices(scores, count) {
-		scores[i] += amount
-	}
-}
-
-func (s *speakerCache) compress(silence []float32) {
-	c := s.c
-	frames := len(s.probs) / c.Speakers
-	scoredFrames := frames + c.SilenceFrames
-	budget := c.CacheLength/c.Speakers - c.SilenceFrames
-	// Speaker-major order is essential: the final sort preserves arrival order
-	// within each speaker, rather than sorting all selected frames by time.
-	scores := make([]float32, c.Speakers*scoredFrames)
-	logComplements := make([]float32, c.Speakers)
-	const logHalf = -math.Ln2
-	for t := 0; t < frames; t++ {
-		var complementSum float32
-		for sp := 0; sp < c.Speakers; sp++ {
-			p := s.probs[t*c.Speakers+sp]
-			logComplements[sp] = float32(math.Log(float64(max(1-p, c.PredictionThreshold))))
-			complementSum += logComplements[sp]
+func poolProbabilities(logits []float32, factor, speakers int) []float32 {
+	pooled := make([]float32, len(logits)/factor)
+	for frame := 0; frame < len(pooled)/speakers; frame++ {
+		averages := pooled[frame*speakers : (frame+1)*speakers]
+		for step := 0; step < factor; step++ {
+			start := (frame*factor + step) * speakers
+			for speaker, logit := range logits[start : start+speakers] {
+				averages[speaker] += sigmoid(logit)
+			}
 		}
-		for sp := 0; sp < c.Speakers; sp++ {
-			p := s.probs[t*c.Speakers+sp]
-			logP := float32(math.Log(float64(max(p, c.PredictionThreshold))))
-			score := logP - logComplements[sp] + complementSum - float32(logHalf)
-			if p <= .5 {
+		for speaker := range averages {
+			averages[speaker] /= float32(factor)
+		}
+	}
+	return pooled
+}
+
+func sigmoid(value float32) float32 {
+	if value >= 0 {
+		return float32(1 / (1 + math.Exp(-float64(value))))
+	}
+	exponent := math.Exp(float64(value))
+	return float32(exponent / (1 + exponent))
+}
+
+// scores favors confident single-speaker frames. A column belongs to one
+// speaker; silence and overlap are excluded according to the checkpoint policy.
+func (s *speakerCache) scores() [][]float32 {
+	config := s.config
+	frames := len(s.probabilities) / config.Speakers
+	columns := make([][]float32, config.Speakers)
+	for speaker := range columns {
+		columns[speaker] = make([]float32, frames)
+	}
+	complements := make([]float32, config.Speakers)
+	for frame := 0; frame < frames; frame++ {
+		row := s.probabilities[frame*config.Speakers : (frame+1)*config.Speakers]
+		var sum float32
+		for speaker, probability := range row {
+			complements[speaker] = float32(math.Log(float64(max(1-probability, config.PredictionThreshold))))
+			sum += complements[speaker]
+		}
+		for speaker, probability := range row {
+			logProbability := float32(math.Log(float64(max(probability, config.PredictionThreshold))))
+			score := logProbability - complements[speaker] + sum + float32(math.Ln2)
+			if probability <= .5 {
 				score = float32(math.Inf(-1))
 			}
-			scores[sp*scoredFrames+t] = score
+			columns[speaker][frame] = score
 		}
 	}
-	for sp := 0; sp < c.Speakers; sp++ {
-		column := scores[sp*scoredFrames : sp*scoredFrames+frames]
+	budget := config.CacheLength/config.Speakers - config.SilenceFrames
+	minimum := int(math.Floor(float64(budget) * config.MinPositiveRate))
+	for _, column := range columns {
 		positive := 0
-		for _, x := range column {
-			if x > 0 {
+		for _, score := range column {
+			if score > 0 {
 				positive++
 			}
 		}
-		if positive >= int(math.Floor(float64(budget)*c.MinPositiveRate)) {
-			for i, x := range column {
-				if x <= 0 {
-					column[i] = float32(math.Inf(-1))
+		if positive >= minimum {
+			for frame, score := range column {
+				if score <= 0 {
+					column[frame] = float32(math.Inf(-1))
 				}
 			}
 		}
-		for i := c.CacheLength; i < frames; i++ {
-			column[i] += c.LatestBoost
+	}
+	return columns
+}
+
+type cacheFrame struct {
+	speaker int
+	frame   int
+	score   float32
+	silence bool
+}
+
+func (s *speakerCache) compress(silence []float32) {
+	config := s.config
+	frames := len(s.embeddings) / config.HiddenSize
+	budget := config.CacheLength/config.Speakers - config.SilenceFrames
+	var candidates []cacheFrame
+	for speaker, scores := range s.scores() {
+		for frame := config.CacheLength; frame < frames; frame++ {
+			scores[frame] += config.LatestBoost
 		}
-		boostTop(column, int(math.Floor(float64(budget)*c.StrongBoost)), -2*float32(logHalf))
-		boostTop(column, int(math.Floor(float64(budget)*c.WeakBoost)), -float32(logHalf))
-		for i := frames; i < scoredFrames; i++ {
-			scores[sp*scoredFrames+i] = float32(math.Inf(1))
+		boostTop(scores, int(math.Floor(float64(budget)*config.StrongBoost)), 2*float32(math.Ln2))
+		boostTop(scores, int(math.Floor(float64(budget)*config.WeakBoost)), float32(math.Ln2))
+		for frame, score := range scores {
+			if !math.IsInf(float64(score), -1) {
+				candidates = append(candidates, cacheFrame{speaker: speaker, frame: frame, score: score})
+			}
+		}
+		for extra := 0; extra < config.SilenceFrames; extra++ {
+			candidates = append(candidates, cacheFrame{
+				speaker: speaker, frame: frames + extra, score: float32(math.Inf(1)), silence: true,
+			})
 		}
 	}
-	indices := topIndices(scores, c.CacheLength)
-	sentinel := len(scores)
-	for i, index := range indices {
-		if math.IsInf(float64(scores[index]), -1) {
-			indices[i] = sentinel
+	// Stable ties use the original speaker/frame order. torch.topk leaves ties
+	// unspecified; either choice follows the same policy for equal scores.
+	slices.SortStableFunc(candidates, func(a, b cacheFrame) int { return cmp.Compare(b.score, a.score) })
+	selected := candidates[:min(len(candidates), config.CacheLength)]
+	slices.SortFunc(selected, func(a, b cacheFrame) int {
+		if a.speaker != b.speaker {
+			return cmp.Compare(a.speaker, b.speaker)
 		}
-	}
-	slices.Sort(indices)
-	embeds := make([]float32, c.CacheLength*c.HiddenSize)
-	probs := make([]float32, c.CacheLength*c.Speakers)
-	for i, index := range indices {
-		t := index % scoredFrames
-		if index == sentinel || t >= frames {
-			copy(embeds[i*c.HiddenSize:], silence)
+		return cmp.Compare(a.frame, b.frame)
+	})
+
+	embeddings := make([]float32, config.CacheLength*config.HiddenSize)
+	probabilities := make([]float32, config.CacheLength*config.Speakers)
+	for frame := 0; frame < config.CacheLength; frame++ {
+		dst := embeddings[frame*config.HiddenSize : (frame+1)*config.HiddenSize]
+		if frame >= len(selected) || selected[frame].silence {
+			copy(dst, silence)
 			continue
 		}
-		copy(embeds[i*c.HiddenSize:], s.embeds[t*c.HiddenSize:(t+1)*c.HiddenSize])
-		copy(probs[i*c.Speakers:], s.probs[t*c.Speakers:(t+1)*c.Speakers])
+		source := selected[frame].frame
+		copy(dst, s.embeddings[source*config.HiddenSize:(source+1)*config.HiddenSize])
+		copy(probabilities[frame*config.Speakers:], s.probabilities[source*config.Speakers:(source+1)*config.Speakers])
 	}
-	s.embeds, s.probs = embeds, probs
+	s.embeddings, s.probabilities = embeddings, probabilities
+}
+
+func boostTop(scores []float32, count int, amount float32) {
+	indices := make([]int, len(scores))
+	for frame := range indices {
+		indices[frame] = frame
+	}
+	slices.SortStableFunc(indices, func(a, b int) int { return cmp.Compare(scores[b], scores[a]) })
+	for _, frame := range indices[:min(count, len(indices))] {
+		scores[frame] += amount
+	}
 }
