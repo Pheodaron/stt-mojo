@@ -1,0 +1,12 @@
+Nemotron Diarization MAX implementation
+
+The speaker-cache algorithm and model topology are adapted from:
+Hugging Face Transformers, Copyright 2026 The HuggingFace Inc. team,
+licensed under the Apache License, Version 2.0.
+https://github.com/huggingface/transformers/tree/420dca92a4cf7d96dfbc1cc46f00375b0681ff8f/src/transformers/models/nemotron3_diarization
+
+The original NVIDIA NeMo Speech implementation was consulted:
+https://github.com/NVIDIA-NeMo/Speech/tree/8eb458b8ee304143426be5070d3f55fb3b5fb736
+
+Model checkpoints are not included. NVIDIA's checkpoint is licensed separately
+under the OpenMDW License Agreement 1.1; its model card is authoritative.
