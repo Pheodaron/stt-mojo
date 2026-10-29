@@ -2,16 +2,8 @@ import numpy as np
 import pytest
 
 from nemotron_diarization_max import ModelConfig
-from nemotron_diarization_max.audio import FeatureExtractor, speaker_segments
+from nemotron_diarization_max.audio import FeatureExtractor
 from nemotron_diarization_max.weights import validate_weights
-
-
-def test_overlap_segments_and_padding():
-    probabilities = np.array([[0.8, 0.1], [0.8, 0.8], [0.1, 0.8], [0.9, 0.9]])
-    assert speaker_segments(probabilities, attention_mask=[1, 1, 1, 0]) == [
-        {"speaker": 0, "start": 0.0, "end": 0.02},
-        {"speaker": 1, "start": 0.01, "end": 0.03},
-    ]
 
 
 def test_reject_incompatible_checkpoint():

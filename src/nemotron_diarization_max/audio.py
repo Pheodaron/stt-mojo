@@ -1,11 +1,9 @@
 """NumPy/SciPy implementation of the checkpoint's unnormalized log-mel frontend."""
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.fft import rfft
-from scipy.signal import resample_poly
 
 
 def _mel_filterbank(sample_rate, n_fft, n_mels):
@@ -98,42 +96,3 @@ class FeatureExtractor:
         mask = np.arange(len(features)) < valid_length
         features *= mask[:, None]
         return AudioFeatures(features[None], mask[None])
-
-
-def resample_mono(audio, sample_rate, target_rate=16000):
-    audio = np.asarray(audio, np.float32)
-    if audio.ndim == 2:
-        audio = audio.mean(axis=1)
-    if audio.ndim != 1 or sample_rate <= 0:
-        raise ValueError("Invalid audio shape or sample rate")
-    if sample_rate != target_rate:
-        gcd = math.gcd(sample_rate, target_rate)
-        audio = resample_poly(audio, target_rate // gcd, sample_rate // gcd)
-    return np.ascontiguousarray(audio, np.float32)
-
-
-def speaker_segments(
-    probabilities, *, threshold=0.5, frame_seconds=0.01, attention_mask=None, duration=None
-):
-    probabilities = np.asarray(probabilities)
-    if probabilities.ndim != 2 or not 0 <= threshold <= 1:
-        raise ValueError("Expected [time, speakers] probabilities and threshold in [0,1]")
-    active = probabilities > threshold
-    if attention_mask is not None:
-        active &= np.asarray(attention_mask, bool)[:, None]
-    changes = np.diff(np.pad(active.astype(np.int8), ((1, 1), (0, 0))), axis=0)
-    segments = []
-    for speaker in range(active.shape[1]):
-        starts, ends = (
-            np.flatnonzero(changes[:, speaker] == 1),
-            np.flatnonzero(changes[:, speaker] == -1),
-        )
-        for start, end in zip(starts, ends):
-            lo, hi = float(start * frame_seconds), float(end * frame_seconds)
-            if duration is not None:
-                lo, hi = min(lo, duration), min(hi, duration)
-            if hi > lo:
-                segments.append(
-                    {"speaker": int(speaker), "start": round(lo, 6), "end": round(hi, 6)}
-                )
-    return sorted(segments, key=lambda x: (x["start"], x["speaker"]))

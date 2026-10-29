@@ -146,7 +146,8 @@ class MaxGraphs:
     def embed(self, features: np.ndarray):
         b, t, m = features.shape
         f = self.config.audio_config.subsampling_factor
-        padded = np.pad(features, ((0, 0), (0, -t % f), (0, 0)))
+        padding = -t % f
+        padded = np.pad(features, ((0, 0), (0, padding), (0, 0))) if padding else features
         return self._run(self.embedding, padded.reshape(b, -1, m * f))
 
     def infer(self, embeddings: np.ndarray, valid_mask: np.ndarray | None = None):

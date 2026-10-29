@@ -1,82 +1,78 @@
-import io
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import soundfile as sf
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
 
 from nemotron_diarization_max.audio import FeatureExtractor
 from nemotron_diarization_max.service import create_app
 
+HEADERS = {"Content-Type": "application/octet-stream"}
 
-def test_http_audio_auth_and_session_lifecycle(reference_pair):
+
+def decode(response):
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert response.headers["x-dtype"] == "float32-le"
+    assert float(response.headers["x-frame-seconds"]) == 0.01
+    shape = tuple(map(int, response.headers["x-shape"].split(",")))
+    return np.frombuffer(response.content, dtype="<f4").reshape(shape)
+
+
+def test_binary_features_match_direct_inference(reference_pair):
+    model, _ = reference_pair
+    features = np.random.default_rng(5).normal(size=(13, 4)).astype("<f4")
+    expected = model(features[None]).logits[0]
+    with TestClient(create_app(model=model)) as client:
+        actual = decode(client.post("/infer/features", headers=HEADERS, content=features.tobytes()))
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_binary_audio_excludes_frontend_padding(reference_pair):
     model, _ = reference_pair
     frontend = FeatureExtractor(feature_size=4)
-    app = create_app(
-        model=model, frontend=frontend, api_key="test-key", max_audio_seconds=1, max_sessions=1
-    )
-    client = TestClient(app)
-    headers = {"Authorization": "Bearer test-key"}
-    assert client.get("/healthz").json()["device"] == "cpu"
-    assert client.post("/v1/diarization/sessions").status_code == 401
-    response = client.post("/v1/diarization/sessions", headers=headers)
-    assert response.status_code == 201
-    key = response.json()["session_id"]
-    assert client.post("/v1/diarization/sessions", headers=headers).status_code == 429
-    route = f"/v1/diarization/sessions/{key}"
-    # Invalid input must not remove the session or advance its frame offset.
-    assert (
-        client.post(
-            route, headers=headers, json={"input_features": [[0.0]], "is_last": True}
-        ).status_code
-        == 422
-    )
-    chunk = np.random.default_rng(0).normal(size=(8, 4)).tolist()
-    response = client.post(
-        route, headers=headers, json={"input_features": chunk, "num_lookahead_frames": 1}
-    )
-    assert response.status_code == 200
-    assert response.json()["frame_offset"] == 0
-    assert len(response.json()["probabilities"]) == 6
-    response = client.post(
-        route, headers=headers, json={"input_features": chunk[:3], "is_last": True}
-    )
-    assert response.status_code == 200
-    assert response.json()["frame_offset"] == 6
-    assert len(response.json()["probabilities"]) == 3
-    assert client.delete(route, headers=headers).status_code == 404
-    wav = io.BytesIO()
-    sf.write(wav, np.zeros(1600, np.float32), 16000, format="WAV")
-    response = client.post(
-        "/v1/audio/diarizations",
-        headers=headers,
-        files={"file": ("silence.wav", wav.getvalue(), "audio/wav")},
-    )
-    assert response.status_code == 200
-    assert response.json()["duration"] == 0.1
-    assert all(s["end"] <= 0.1 for s in response.json()["segments"])
-    assert (
-        client.post(
-            "/v1/audio/diarizations",
-            headers=headers,
-            files={"file": ("bad.wav", b"not an audio file")},
-        ).status_code
-        == 422
-    )
+    audio = np.random.default_rng(6).normal(0, 0.1, 1607).astype("<f4")
+    inputs = frontend(audio)
+    expected = model(inputs.input_features, inputs.attention_mask).logits[0, :10]
+    with TestClient(create_app(model=model, frontend=frontend)) as client:
+        actual = decode(client.post("/infer/audio", headers=HEADERS, content=audio.tobytes()))
+    assert actual.shape == (10, 2)
+    np.testing.assert_array_equal(actual, expected)
 
 
-def test_upload_and_decoded_duration_limits(reference_pair):
+def test_concurrent_requests_remain_independent(reference_pair):
     model, _ = reference_pair
-    client = TestClient(create_app(model=model, max_upload_bytes=64))
-    assert (
-        client.post("/v1/audio/diarizations", files={"file": ("big.wav", b"x" * 65)}).status_code
-        == 413
-    )
-    client = TestClient(create_app(model=model, max_audio_seconds=0.01))
-    wav = io.BytesIO()
-    sf.write(wav, np.zeros(320, np.float32), 16000, format="WAV")
-    assert (
-        client.post(
-            "/v1/audio/diarizations", files={"file": ("long.wav", wav.getvalue())}
-        ).status_code
-        == 413
-    )
+    rng = np.random.default_rng(7)
+    inputs = [rng.normal(size=(frames, 4)).astype("<f4") for frames in (19, 7, 23, 13)]
+    expected = [model(features[None]).logits[0].copy() for features in inputs]
+    with TestClient(create_app(model=model)) as client, ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(
+            pool.map(
+                lambda features: decode(
+                    client.post("/infer/features", headers=HEADERS, content=features.tobytes())
+                ),
+                inputs,
+            )
+        )
+    for actual, reference in zip(results, expected):
+        np.testing.assert_array_equal(actual, reference)
+
+
+def test_only_inference_routes_are_exposed(reference_pair):
+    model, _ = reference_pair
+    app = create_app(model=model)
+    assert {route.path for route in app.routes} == {"/infer/audio", "/infer/features"}
+
+
+def test_reject_invalid_binary_input(reference_pair):
+    model, _ = reference_pair
+    with TestClient(create_app(model=model)) as client:
+        for route, payload in [
+            ("/infer/audio", b""),
+            ("/infer/audio", b"x"),
+            ("/infer/audio", np.zeros(159, dtype="<f4").tobytes()),
+            ("/infer/features", np.zeros(5, dtype="<f4").tobytes()),
+            ("/infer/features", np.full(4, np.nan, dtype="<f4").tobytes()),
+            ("/infer/audio", np.full(320, np.inf, dtype="<f4").tobytes()),
+        ]:
+            assert client.post(route, headers=HEADERS, content=payload).status_code == 422
+        assert client.post("/infer/features", json=[[0, 0, 0, 0]]).status_code == 415

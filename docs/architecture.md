@@ -78,10 +78,21 @@ compile-time constants. The shard index may name only local filenames; standard
 Hugging Face cache symlinks to blob storage are supported. Inference output
 buffers are copied before returning to callers.
 
-The HTTP service serializes access to one model instance, and stores independent
-cache objects per session. Offline calls create isolated cache state. The current
-service provides synchronous file processing and HTTP streaming of log-mel chunks;
-it does not implement raw PCM WebSocket transport or MAX Serve scheduler support.
+The HTTP service exposes only `/infer/audio` and `/infer/features`. Requests and
+responses are raw little-endian float32 bytes. Audio is mono at 16 kHz; features
+are row-major log-mel matrices. Responses contain raw logits, not probabilities
+or segments. Input arrays are views of the request bytes, without JSON numeric
+lists, file decoding, or resampling. The model is compiled once at startup.
+
+Requests are independent: no session registry, TTL, result cache, or state shared
+between requests. AOSC/FIFO are private to a single model call and discarded when
+it completes. Updating this state after the last offline chunk is skipped.
+Speaker IDs have no correspondence across separate requests.
+
+One CPU inference runs at a time through an asynchronous capacity limiter, so
+requests wait without holding a blocked request thread. MAX uses its own CPU
+execution threads. This is not a batching scheduler. The service does not use
+MAX Serve, and concurrent execution on one model instance is not enabled.
 
 GPU device placement, BF16, fused attention kernels, device-resident cache updates,
 and benchmarking against NeMo are later optimization work. CPU numerical

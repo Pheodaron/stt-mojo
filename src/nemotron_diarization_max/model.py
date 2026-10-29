@@ -105,7 +105,7 @@ class NemotronDiarization:
             context_start = max(0, start - lc)
             chunk = embeds[:, context_start : min(stop + rc, embeds.shape[1])]
             cached = cache.get_embeds(chunk)
-            inputs = np.concatenate([cached, chunk], axis=1)
+            inputs = np.concatenate([cached, chunk], axis=1) if cached.shape[1] else chunk
             valid = (
                 None
                 if mask is None
@@ -119,17 +119,21 @@ class NemotronDiarization:
             )
             prediction = self.graphs.infer(inputs, valid)
             lookback = start - context_start
-            cache.update(
-                inputs,
-                prediction,
-                self.weights["silence_embeds"],
-                stop - start,
-                mask=valid,
-                num_lookback_frames=lookback,
-            )
+            # Offline state is discarded after the last step, so do not pool
+            # probabilities or compress a cache that will never be read again.
+            if streaming or stop < end:
+                cache.update(
+                    inputs,
+                    prediction,
+                    self.weights["silence_embeds"],
+                    stop - start,
+                    mask=valid,
+                    num_lookback_frames=lookback,
+                )
             lo = (cached.shape[1] + lookback) * factor
             logits.append(prediction[:, lo : lo + (stop - start) * factor])
+        combined = logits[0] if len(logits) == 1 else np.concatenate(logits, axis=1)
         return DiarizationOutput(
-            np.concatenate(logits, axis=1)[:, : features.shape[1] - left * factor],
+            combined[:, : features.shape[1] - left * factor],
             cache if streaming else None,
         )
